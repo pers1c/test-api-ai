@@ -1,0 +1,14 @@
+/.claude
+/.venv
+project_ru
+test.zip
+test
+results.json
+models.json
+config.yaml
+llm_response.txt
+openapi.json
+.idea
+__pycache__
+!ВКР (5).docx
+*.docx
