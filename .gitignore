@@ -12,3 +12,5 @@ openapi.json
 __pycache__
 !ВКР (5).docx
 *.docx
+/vkr
+.gitignore
