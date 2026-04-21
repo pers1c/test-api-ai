@@ -23,7 +23,7 @@ DEFAULT_OUTPUT = "results.json"
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="api-tester",
-        description="Инструмент автоматизированного тестирования REST API на основе Claude AI.",
+        description="Инструмент автоматизированного тестирования REST API на основе LLM (GPTunnel).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
@@ -52,7 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help=(
             "Путь к YAML-файлу конфигурации. "
-            "По умолчанию ищется config.yaml / config.yml / .api-tester.yaml."
+            "По умолчанию ищется config.yaml в текущей директории."
         ),
     )
     parser.add_argument(
@@ -70,16 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--api-key",
         default=None,
         metavar="KEY",
-        help=(
-            "API-ключ провайдера LLM. "
-            "Переопределяет переменные окружения GPTUNNEL_API_KEY / ANTHROPIC_API_KEY."
-        ),
-    )
-    parser.add_argument(
-        "--provider",
-        default=None,
-        metavar="PROVIDER",
-        help="Провайдер LLM: gptunnel | anthropic. Переопределяет значение из конфига.",
+        help="API-ключ GPTunnel. Переопределяет переменную окружения GPTUNNEL_API_KEY.",
     )
     parser.add_argument(
         "--model",
@@ -117,7 +108,7 @@ def main() -> int:
       1. Парсинг аргументов CLI
       2. Загрузка конфигурации
       3. Парсинг OpenAPI-спецификации
-      4. Анализ спецификации через Claude AI -> генерация тест-сьюта
+      4. Анализ спецификации через LLM -> генерация тест-сьюта
       5. Выполнение тест-сьюта против целевого сервера
       6. Формирование и сохранение JSON-отчёта
       7. Вывод сводки в консоль
@@ -137,7 +128,7 @@ def main() -> int:
     console.print(Rule("[dim]Конфигурация[/dim]"))
     try:
         config = load_config(args.config)
-        console.print(f"  Провайдер: [cyan]{config.ai_settings.provider.value}[/cyan]  Модель: [cyan]{config.ai_settings.model}[/cyan]")
+        console.print(f"  Модель:             [cyan]{config.ai_settings.model}[/cyan]")
         console.print(f"  Тип аутентификации: [cyan]{config.auth.type}[/cyan]")
         console.print(f"  Таймаут:            {config.test_settings.timeout}с")
     except (FileNotFoundError, ValueError) as exc:
@@ -151,9 +142,6 @@ def main() -> int:
         config.ai_settings.include_negative_tests = False
     if args.no_edge_cases:
         config.ai_settings.include_edge_cases = False
-    if args.provider is not None:
-        from models import LLMProvider
-        config.ai_settings.provider = LLMProvider(args.provider)
     if args.model is not None:
         config.ai_settings.model = args.model
 
@@ -183,7 +171,7 @@ def main() -> int:
         return 1
 
     if not suite.test_cases:
-        console.print("[yellow]Предупреждение: Claude не сгенерировал ни одного тест-кейса.[/yellow]")
+        console.print("[yellow]Предупреждение: LLM не сгенерировал ни одного тест-кейса.[/yellow]")
         return 0
 
     # Выводим разбивку по типам тест-кейсов

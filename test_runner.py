@@ -1,12 +1,17 @@
+"""
+HTTP-исполнитель тестов: выполняет сгенерированный LLM тест-сьют против целевого API.
+
+Все вывод-события передаются через опциональный on_test_complete callback —
+ничего не печатается в stdout, так как модуль работает в контексте web-сервера.
+"""
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
 
 import httpx
-from rich.console import Console
 
 from config import build_auth_headers, build_auth_query_params
 from context_manager import ContextManager
@@ -19,38 +24,38 @@ from models import (
     TestSuite,
 )
 
-console = Console()
-
-# Таймаут для одного HTTP-запроса (в секундах)
-_DEFAULT_TIMEOUT = 30.0
 
 # Публичная точка входа
-def run_test_suite(
+async def run_test_suite_async(
     suite: TestSuite,
     base_url: str,
     config: AppConfig,
-    verbose: bool = False,
+    on_test_complete: Optional[Any] = None,
 ) -> List[TestResult]:
     """
     Выполняет все тест-кейсы из сьюта против целевого сервера.
 
     Аргументы:
-        suite:    Сгенерированный тест-сьют от Claude.
-        base_url: Базовый URL API-сервера (например "https://api.example.com").
-        config:   Конфигурация приложения (аутентификация, таймауты, задержки).
-        verbose:  Выводить ли детальный вывод по каждому шагу.
+        suite:            Сгенерированный тест-сьют от LLM.
+        base_url:         Базовый URL API-сервера (например "https://api.example.com").
+        config:           Конфигурация приложения (аутентификация, таймауты, задержки).
+        on_test_complete: Async callback (index, total, result) -> None,
+                          вызывается после завершения каждого тест-кейса.
 
     Возвращает:
         Список TestResult, по одному на каждый тест-кейс.
     """
-    return asyncio.run(_run_suite_async(suite, base_url, config, verbose=verbose))
+    return await _run_suite_async(
+        suite, base_url, config,
+        on_test_complete=on_test_complete,
+    )
 
-# Асинхронная реализация
+
 async def _run_suite_async(
     suite: TestSuite,
     base_url: str,
     config: AppConfig,
-    verbose: bool = False,
+    on_test_complete: Optional[Any] = None,
 ) -> List[TestResult]:
     """Асинхронная реализация, выполняющая все тест-кейсы последовательно."""
     auth_headers = build_auth_headers(config)
@@ -63,8 +68,7 @@ async def _run_suite_async(
 
     # Защита от задвоенного протокола (например "http:/http://...")
     # Возникает если пользователь случайно передал URL с дублем
-    import re as _re
-    base_url = _re.sub(r'^https?:/+(?=https?://)', '', base_url)
+    base_url = re.sub(r'^https?:/+(?=https?://)', '', base_url)
 
     # Проверяем что URL начинается с http:// или https://
     if not base_url.startswith(("http://", "https://")):
@@ -74,19 +78,18 @@ async def _run_suite_async(
             "например: http://localhost:8000"
         )
 
+    total = len(suite.test_cases)
+
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(settings.timeout),
         follow_redirects=True,
         verify=True,
-        # Отключаем системный прокси для локальных адресов — иначе httpx на Windows пытается проксировать 127.0.0.1
+        # Отключаем системный прокси для локальных адресов — иначе httpx на Windows
+        # пытается проксировать 127.0.0.1
         proxy=None,
         trust_env=False,
     ) as http_client:
-        for test_case in suite.test_cases:
-            console.print(
-                f"\n[bold]Выполняется[/bold] [{_type_colour(test_case.type)}]{test_case.type}[/{_type_colour(test_case.type)}] "
-                f"[white]{test_case.id}[/white]: [dim]{test_case.name}[/dim]"
-            )
+        for i, test_case in enumerate(suite.test_cases, start=1):
             result = await _run_test_case(
                 test_case=test_case,
                 base_url=base_url,
@@ -94,10 +97,16 @@ async def _run_suite_async(
                 auth_headers=auth_headers,
                 auth_query_params=auth_query_params,
                 settings=settings,
-                verbose=verbose,
             )
             results.append(result)
-            _print_result_line(result, verbose=verbose)
+
+            # Уведомляем web-UI о завершении тест-кейса
+            if on_test_complete is not None:
+                try:
+                    await on_test_complete(i, total, result)
+                except Exception:
+                    # Сбои в UI-колбэке не должны ронять прогон
+                    pass
 
             # Задержка между тест-кейсами
             if settings.delay_between_requests > 0:
@@ -113,7 +122,6 @@ async def _run_test_case(
     auth_headers: Dict[str, str],
     auth_query_params: Dict[str, str],
     settings: Any,
-    verbose: bool = False,
 ) -> TestResult:
     """
     Выполняет все шаги одного тест-кейса по порядку.
@@ -145,11 +153,6 @@ async def _run_test_case(
                     error_message=f"Пропущен: требуемые переменные недоступны: {missing}",
                 )
                 step_results.append(skipped_result)
-                if verbose:
-                    console.print(
-                        f"  [yellow]ПРОПУСК[/yellow] Шаг {step_index + 1}: {step.description} "
-                        f"(отсутствуют переменные: {missing})"
-                    )
                 overall_status = "failed"
                 continue
 
@@ -163,7 +166,6 @@ async def _run_test_case(
             context=context,
             auth_headers=auth_headers,
             auth_query_params=auth_query_params,
-            verbose=verbose,
         )
         step_results.append(step_result)
 
@@ -202,7 +204,6 @@ async def _run_step(
     context: ContextManager,
     auth_headers: Dict[str, str],
     auth_query_params: Dict[str, str],
-    verbose: bool = False,
 ) -> StepResult:
     """
     Выполняет один HTTP-запрос и возвращает его результат.
@@ -221,11 +222,6 @@ async def _run_step(
 
     # Объединяем query-параметры: дефолты аутентификации + специфичные для шага
     merged_query = {**(auth_query_params or {}), **(step.query_params or {})}
-
-    if verbose:
-        console.print(
-            f"  [dim]-> {step.method} {request_url}[/dim]"
-        )
 
     start_time = time.perf_counter()
     error_message: Optional[str] = None
@@ -270,22 +266,12 @@ async def _run_step(
     if passed and step.extract and response_body is not None:
         try:
             extracted_values = context.extract_values(response_body, step.extract)
-            if verbose and extracted_values:
-                console.print(f"  [dim]   Извлечено: {extracted_values}[/dim]")
-        except Exception as exc:
-            # Некритично: ошибка извлечения логируется, но не провалит шаг
-            if verbose:
-                console.print(f"  [dim]   Предупреждение извлечения: {exc}[/dim]")
+        except Exception:
+            # Некритично: ошибка извлечения игнорируется, но не провалит шаг
+            pass
 
     # Маскируем чувствительные заголовки в выводе
     safe_headers = _sanitise_headers(merged_headers)
-
-    if verbose:
-        status_tag = "[green]УСПЕХ[/green]" if passed else "[red]ПРОВАЛ[/red]"
-        console.print(
-            f"  {status_tag} {step.method} {endpoint} "
-            f"-> ожидался {step.expected_status}, получен {actual_status}"
-        )
 
     return StepResult(
         step_description=step.description,
@@ -305,6 +291,7 @@ async def _run_step(
         skipped=False,
     )
 
+
 # Вспомогательные функции
 def _sanitise_headers(headers: Dict[str, str]) -> Dict[str, str]:
     """Маскирует чувствительные значения заголовков (токены) для безопасного хранения в отчётах."""
@@ -321,31 +308,3 @@ def _sanitise_headers(headers: Dict[str, str]) -> Dict[str, str]:
         else:
             result[name] = value
     return result
-
-
-def _type_colour(test_type: str) -> str:
-    """Возвращает название цвета Rich в зависимости от типа теста."""
-    return {
-        "stateless": "blue",
-        "contextual": "magenta",
-        "status_code": "cyan",
-    }.get(test_type, "white")
-
-
-def _print_result_line(result: TestResult, verbose: bool = False) -> None:
-    """Выводит однострочную сводку результата тест-кейса."""
-    if verbose:
-        return  # В verbose-режиме детали шагов уже выведены
-
-    colour_map = {
-        "passed": "green",
-        "failed": "red",
-        "error": "yellow",
-        "skipped": "dim",
-    }
-    colour = colour_map.get(result.status, "white")
-    steps_info = f"{len(result.steps_results)} шаг(ов)"
-    console.print(
-        f"  [{colour}]{result.status.upper()}[/{colour}] "
-        f"[dim]{steps_info} | {result.duration_ms:.0f}мс[/dim]"
-    )

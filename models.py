@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, ConfigDict
 
 
-class LLMProvider(str, Enum):
-    """Поддерживаемые LLM-провайдеры."""
-    GPTUNNEL  = "gptunnel"   # OpenAI-совместимый прокси, https://gptunnel.ru
-
-# Модели тест-кейсов (генерируются Claude AI)
+# Модели тест-кейсов (генерируются LLM)
 class TestStep(BaseModel):
     """Один HTTP-запрос в рамках тест-кейса."""
 
@@ -42,7 +37,7 @@ class TestCase(BaseModel):
 
 
 class TestSuite(BaseModel):
-    """Корневой контейнер, возвращаемый Claude AI после анализа спецификации."""
+    """Корневой контейнер, возвращаемый LLM после анализа спецификации."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -104,6 +99,7 @@ class TestReport(BaseModel):
     base_url: str
     spec_file: str
     config_file: Optional[str] = None
+    cost: Optional[Dict[str, Any]] = None  # {estimated, actual} — см. cost_estimator.CostEstimate
 
 # Модели конфигурации
 class AuthConfig(BaseModel):
@@ -124,13 +120,10 @@ class TestSettings(BaseModel):
 
 
 class AISettings(BaseModel):
-    """Настройки генерации тест-кейсов через LLM."""
+    """Настройки генерации тест-кейсов через LLM (GPTunnel, OpenAI-совместимый API)."""
 
-    # --- Провайдер и модель ---
-    provider: LLMProvider = LLMProvider.GPTUNNEL
-    # Модель по умолчанию для GPTunnel. Примеры других моделей:
-    #   GPTunnel:  "gpt-4o", "gpt-4o-mini", "o1", "claude-opus-4-6", "gemini-2.5-pro"
-    #   Anthropic: "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"
+    # Модель по умолчанию. Примеры доступных моделей в GPTunnel:
+    #   "gpt-4o", "gpt-4o-mini", "o1", "claude-opus-4-6", "gemini-2.5-pro"
     model: str = "gpt-4o"
     max_tokens: int = 16000
 
@@ -146,3 +139,35 @@ class AppConfig(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     test_settings: TestSettings = Field(default_factory=TestSettings)
     ai_settings: AISettings = Field(default_factory=AISettings)
+    pricing: "PricingConfig" = Field(default_factory=lambda: PricingConfig())
+
+
+# Модели ценообразования
+class ModelPrice(BaseModel):
+    """Цена одной модели LLM: рубли за 1 миллион токенов, раздельно вход/выход."""
+
+    input_per_1m: float = Field(
+        ..., description="Стоимость входных токенов, руб. за 1M",
+    )
+    output_per_1m: float = Field(
+        ..., description="Стоимость выходных токенов, руб. за 1M",
+    )
+
+
+class PricingConfig(BaseModel):
+    """
+    Пользовательские цены моделей, переопределяют встроенные дефолты.
+
+    Ключ — имя модели как оно передаётся в GPTunnel API (например "gpt-4o").
+    Можно добавлять новые модели, которых нет в дефолтах.
+    """
+
+    models: Dict[str, ModelPrice] = Field(default_factory=dict)
+
+
+# Поле cost в TestReport обновляется после добавления модели Cost (ниже).
+class Cost(BaseModel):
+    """Данные о стоимости прогона — оценка до и/или факт после."""
+
+    estimated: Optional[Dict[str, Any]] = None  # CostEstimate.to_dict()
+    actual:    Optional[Dict[str, Any]] = None  # CostEstimate.to_dict()

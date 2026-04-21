@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI API Tester</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <!-- IBM Plex для монолитного технического духа, Fraunces для характерных заголовков -->
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <!-- Шапка -->
+  <header class="header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-mark">◆</span>
+        <span class="brand-name">API<span class="brand-dot">·</span>Tester</span>
+      </div>
+      <nav class="tabs">
+        <button class="tab active" data-view="new">Новый прогон</button>
+        <button class="tab" data-view="runs">История</button>
+      </nav>
+      <div class="health" id="health-indicator" title="Проверка конфигурации">
+        <span class="health-dot"></span>
+        <span class="health-text">—</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Представление: новый прогон -->
+    <section class="view" id="view-new">
+      <div class="section-header">
+        <h1 class="section-title">Запустить тестирование</h1>
+        <p class="section-subtitle">
+          Загрузите OpenAPI-спеку и укажите URL сервиса.
+          Генерация происходит в два этапа через GPTunnel.
+        </p>
+      </div>
+
+      <form id="run-form" class="form">
+        <!-- Файл спеки -->
+        <div class="field">
+          <label class="field-label" for="spec-file">OpenAPI спецификация</label>
+          <div class="file-drop" id="file-drop">
+            <input type="file" id="spec-file" name="spec" accept=".json,.yaml,.yml" required />
+            <div class="file-drop-content">
+              <span class="file-drop-icon">↑</span>
+              <span class="file-drop-text" id="file-drop-text">
+                Перетащите файл или нажмите, чтобы выбрать
+              </span>
+              <span class="file-drop-hint">.json · .yaml · .yml</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- URL -->
+        <div class="field">
+          <label class="field-label" for="base-url">Базовый URL</label>
+          <input
+            type="url"
+            id="base-url"
+            name="base_url"
+            class="input"
+            placeholder="https://api.example.com"
+            required
+          />
+        </div>
+
+        <!-- Две колонки: модель и кол-во тестов -->
+        <div class="field-row">
+          <div class="field">
+            <label class="field-label" for="model">Модель LLM</label>
+            <select id="model" name="model" class="input">
+              <option value="">По умолчанию (из config.yaml)</option>
+              <option value="gpt-4o">gpt-4o</option>
+              <option value="gpt-4o-mini">gpt-4o-mini</option>
+              <option value="claude-opus-4-6">claude-opus-4-6</option>
+              <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+              <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="max-tests">Макс. тест-кейсов</label>
+            <input
+              type="number"
+              id="max-tests"
+              name="max_tests"
+              class="input"
+              min="1"
+              max="100"
+              placeholder="20"
+            />
+          </div>
+        </div>
+
+        <!-- Опции генерации -->
+        <div class="field">
+          <label class="field-label">Генерация</label>
+          <div class="checkbox-group">
+            <label class="checkbox">
+              <input type="checkbox" name="include_negative" checked />
+              <span>Негативные тесты</span>
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="include_edge_cases" checked />
+              <span>Граничные случаи</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Авторизация тестируемого API -->
+        <details class="auth-details">
+          <summary class="auth-summary">Авторизация тестируемого API</summary>
+          <div class="auth-body">
+            <div class="field-row">
+              <div class="field">
+                <label class="field-label" for="auth-type">Тип</label>
+                <select id="auth-type" name="auth_type" class="input">
+                  <option value="none">Без авторизации</option>
+                  <option value="bearer">Bearer-токен</option>
+                  <option value="api_key">API-ключ (заголовок)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field-label" for="auth-token">Токен</label>
+                <input
+                  type="password"
+                  id="auth-token"
+                  name="auth_token"
+                  class="input"
+                  placeholder="необязательно"
+                  autocomplete="off"
+                />
+              </div>
+            </div>
+            <div class="field" id="auth-header-field" style="display:none">
+              <label class="field-label" for="auth-header-name">Имя заголовка</label>
+              <input
+                type="text"
+                id="auth-header-name"
+                name="auth_header_name"
+                class="input"
+                placeholder="X-API-Key"
+              />
+            </div>
+          </div>
+        </details>
+
+        <!-- Оценка стоимости -->
+        <div class="estimate" id="estimate-panel" hidden>
+          <div class="estimate-header">
+            <span class="estimate-label">Ожидаемая стоимость</span>
+            <button type="button" class="btn-link" id="estimate-refresh" title="Пересчитать">↻</button>
+          </div>
+          <div class="estimate-body" id="estimate-body">
+            <div class="estimate-price" id="estimate-price">—</div>
+            <div class="estimate-meta" id="estimate-meta">—</div>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary" id="submit-btn">
+            <span class="btn-label">Запустить</span>
+            <span class="btn-arrow">→</span>
+          </button>
+        </div>
+      </form>
+
+      <!-- Live-прогресс -->
+      <div class="live" id="live-panel" hidden>
+        <div class="live-header">
+          <div class="live-status">
+            <span class="live-dot" id="live-dot"></span>
+            <span class="live-status-text" id="live-status-text">ожидание</span>
+          </div>
+          <span class="live-run-id" id="live-run-id">—</span>
+        </div>
+
+        <div class="live-stages" id="live-stages">
+          <div class="stage" data-stage="parsing">
+            <span class="stage-mark">01</span>
+            <span class="stage-name">Парсинг спеки</span>
+          </div>
+          <div class="stage" data-stage="generating">
+            <span class="stage-mark">02</span>
+            <span class="stage-name">Генерация тестов</span>
+          </div>
+          <div class="stage" data-stage="executing">
+            <span class="stage-mark">03</span>
+            <span class="stage-name">Выполнение</span>
+          </div>
+        </div>
+
+        <div class="live-log" id="live-log"></div>
+
+        <div class="live-summary" id="live-summary" hidden>
+          <div class="summary-stats" id="summary-stats"></div>
+          <div class="summary-actions">
+            <button class="btn btn-ghost" id="view-report-btn">Открыть отчёт</button>
+            <a class="btn btn-ghost" id="download-report-btn" href="#" download>Скачать JSON</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Представление: список прогонов -->
+    <section class="view" id="view-runs" hidden>
+      <div class="section-header">
+        <h1 class="section-title">История прогонов</h1>
+        <button class="btn btn-ghost btn-small" id="refresh-runs">
+          <span class="btn-label">Обновить</span>
+          <span class="btn-arrow">↻</span>
+        </button>
+      </div>
+      <div class="runs-list" id="runs-list">
+        <div class="empty">Загрузка…</div>
+      </div>
+    </section>
+
+    <!-- Представление: детальный отчёт -->
+    <section class="view" id="view-report" hidden>
+      <div class="report-header">
+        <button class="btn btn-ghost btn-small" id="back-to-runs">← Назад</button>
+        <div class="report-title" id="report-title">Отчёт</div>
+        <a class="btn btn-ghost btn-small" id="report-download" href="#" download>Скачать JSON</a>
+      </div>
+
+      <div class="report-summary" id="report-summary"></div>
+
+      <div class="report-tests" id="report-tests"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
