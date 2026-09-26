@@ -45,6 +45,10 @@ class TestSuite(BaseModel):
     generated_at: Optional[str] = None
     spec_title: Optional[str] = None
     spec_version: Optional[str] = None
+    # Пункты плана, которые НЕ попали в test_cases (провал генерации после ретраев
+    # или отбраковка пост-валидатором). Заполняется генератором, чтобы потерянные
+    # кейсы были видны, а не исчезали молча. Элемент: {id, name, type, stage, reason}.
+    failed_generations: Optional[List[Dict[str, Any]]] = None
 
 # Модели результатов (формируются после выполнения тестов)
 class StepResult(BaseModel):
@@ -65,6 +69,10 @@ class StepResult(BaseModel):
     error_message: Optional[str] = None
     extracted_values: Optional[Dict[str, str]] = None
     skipped: bool = False
+    # Нарушения схемы тела ответа (если включена валидация и они найдены).
+    # Непустой список означает, что статус-код совпал, но тело не соответствует
+    # объявленной в спеке схеме ответа — шаг считается проваленным.
+    schema_errors: Optional[List[str]] = None
 
 
 class TestResult(BaseModel):
@@ -91,6 +99,46 @@ class ReportSummary(BaseModel):
     timestamp: str
 
 
+# Модели покрытия эндпоинтов тест-кейсами
+class EndpointCaseRef(BaseModel):
+    """Связь одного тест-кейса с одним эндпоинтом (агрегировано по шагам кейса)."""
+
+    test_case_id: str
+    test_case_name: str
+    # primary — эндпоинт является целью проверки; setup — задействован как
+    # вспомогательный (auth-префикс register/login для получения токена).
+    role: Literal["primary", "setup"]
+    expected_statuses: List[int] = Field(default_factory=list)
+    # Итог касания эндпоинта этим кейсом: passed/failed/skipped/mixed
+    outcome: Literal["passed", "failed", "skipped", "mixed"]
+
+
+class EndpointCoverage(BaseModel):
+    """Покрытие одной операции спеки всеми тест-кейсами прогона."""
+
+    method: str
+    path: str
+    covered: bool          # задействован хотя бы одним шагом (любая роль)
+    tested: bool           # задействован как primary хотя бы в одном кейсе
+    has_happy_path: bool   # есть проходящий primary-тест с 2xx
+    negative_only: bool    # покрыт как primary, но только негативными (не-2xx) проверками
+    case_count: int        # сколько кейсов касаются эндпоинта (любая роль)
+    cases: List[EndpointCaseRef] = Field(default_factory=list)
+    # Человекочитаемые пометки о дырах покрытия (пусто = всё хорошо)
+    flags: List[str] = Field(default_factory=list)
+
+
+class CoverageReport(BaseModel):
+    """Сводная матрица покрытия эндпоинтов тест-кейсами."""
+
+    total_endpoints: int
+    covered: int           # покрыто хотя бы как-то
+    tested: int            # покрыто как primary
+    happy_path: int        # есть проходящий 2xx primary
+    flagged: int           # эндпоинтов с непустыми flags (дыры покрытия)
+    endpoints: List[EndpointCoverage] = Field(default_factory=list)
+
+
 class TestReport(BaseModel):
     """Полный отчёт о прогоне тестов, сохраняемый в JSON."""
 
@@ -100,6 +148,7 @@ class TestReport(BaseModel):
     spec_file: str
     config_file: Optional[str] = None
     cost: Optional[Dict[str, Any]] = None  # {estimated, actual} — см. cost_estimator.CostEstimate
+    coverage: Optional[CoverageReport] = None  # матрица покрытия эндпоинтов (см. coverage.py)
 
 # Модели конфигурации
 class AuthConfig(BaseModel):
@@ -117,6 +166,9 @@ class TestSettings(BaseModel):
     timeout: float = 30.0
     max_retries: int = 1
     delay_between_requests: float = 0.5
+    # Проверять тело ответа против объявленной в спеке схемы (type/required/enum/nullable).
+    # Если статус-код совпал, но тело не соответствует схеме — шаг проваливается.
+    validate_response_body: bool = True
 
 
 class AISettings(BaseModel):
@@ -128,9 +180,19 @@ class AISettings(BaseModel):
     max_tokens: int = 16000
 
     # --- Параметры генерации тестов ---
-    max_test_cases: int = 20
+    # Жёсткий верхний предел числа тест-кейсов. Реальное число рассчитывается
+    # из структуры API (см. _compute_test_targets в ai_analyzer.py) и обычно
+    # составляет ~3–5 кейсов на эндпоинт. Этот параметр служит защитой от
+    # неконтролируемого роста стоимости генерации, а не целевым значением.
+    max_test_cases: int = 200
     include_negative_tests: bool = True
     include_edge_cases: bool = True
+
+    # Свободные инструкции от пользователя, которые передаются и планировщику, и
+    # генератору. Полезно для уточнений после первого прогона ("проверь rate-limit
+    # на /search", "обязательно покрой негативами /admin/*", и т.п.).
+    # None или пустая строка означает отсутствие дополнительных инструкций.
+    user_instructions: Optional[str] = None
 
 
 class AppConfig(BaseModel):

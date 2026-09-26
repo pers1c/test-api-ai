@@ -29,20 +29,20 @@ from spec_parser import OpenAPISpec
 # Могут быть переопределены через pricing.models в config.yaml.
 # ============================================================
 DEFAULT_PRICES: Dict[str, ModelPrice] = {
-    # OpenAI
-    "gpt-4o":           ModelPrice(input_per_1m=220.0,  output_per_1m=880.0),
-    "gpt-4o-mini":      ModelPrice(input_per_1m=13.0,   output_per_1m=52.0),
-    "o1":               ModelPrice(input_per_1m=1300.0, output_per_1m=5200.0),
-    "o1-mini":          ModelPrice(input_per_1m=260.0,  output_per_1m=1040.0),
+    # OpenAI (цены GPTunnel, актуальны на май 2026)
+    "gpt-4o": ModelPrice(input_per_1m=1350.0, output_per_1m=2700.0),
+    "gpt-4o-mini": ModelPrice(input_per_1m=120.0, output_per_1m=2700.0),
+    "o1": ModelPrice(input_per_1m=4500.0, output_per_1m=18000.0),
+    "o1-mini": ModelPrice(input_per_1m=1200.0, output_per_1m=4800.0),
 
     # Anthropic
-    "claude-opus-4-6":   ModelPrice(input_per_1m=1500.0, output_per_1m=7500.0),
-    "claude-sonnet-4-6": ModelPrice(input_per_1m=300.0,  output_per_1m=1500.0),
-    "claude-haiku-4-5":  ModelPrice(input_per_1m=80.0,   output_per_1m=400.0),
+    "claude-opus-4-6": ModelPrice(input_per_1m=1500.0, output_per_1m=7500.0),
+    "claude-sonnet-4-6": ModelPrice(input_per_1m=1200.0,  output_per_1m=4500.0),
+    "claude-haiku-4-5": ModelPrice(input_per_1m=200.0,   output_per_1m=1000.0),
 
     # Google
-    "gemini-2.5-pro":    ModelPrice(input_per_1m=130.0,  output_per_1m=520.0),
-    "gemini-2.5-flash":  ModelPrice(input_per_1m=30.0,   output_per_1m=120.0),
+    "gemini-2.5-pro": ModelPrice(input_per_1m=350.0,  output_per_1m=1500.0),
+    "gemini-2.5-flash": ModelPrice(input_per_1m=60.0,   output_per_1m=180.0),
 }
 
 
@@ -51,16 +51,16 @@ DEFAULT_PRICES: Dict[str, ModelPrice] = {
 # ============================================================
 
 # Planner — один вызов
-_PLANNER_BASE_INPUT   = 800     # системный промпт + правила + структура
+_PLANNER_BASE_INPUT = 800     # системный промпт + правила + структура
 _PLANNER_PER_ENDPOINT = 30      # строка сводки на каждый эндпоинт
-_PLANNER_FEW_SHOT     = 400     # пример
+_PLANNER_FEW_SHOT = 400     # пример
 _PLANNER_OUTPUT_PER_CASE = 70   # один элемент плана — ~70 токенов
 
 # Generator — на каждый тест-кейс
-_GEN_BASE_INPUT     = 900       # системный промпт + правила + few-shot разметка
-_GEN_FEW_SHOT       = 500       # пример
-_GEN_SPEC_FRAGMENT  = 600       # релевантные фрагменты спеки (оценка среднего)
-_GEN_PLAN_ITEM      = 100       # описание пункта плана
+_GEN_BASE_INPUT = 900       # системный промпт + правила + few-shot разметка
+_GEN_FEW_SHOT = 500       # пример
+_GEN_SPEC_FRAGMENT = 600       # релевантные фрагменты спеки (оценка среднего)
+_GEN_PLAN_ITEM = 100       # описание пункта плана
 
 # Выход генератора зависит от типа теста (в среднем)
 _GEN_OUTPUT_STATELESS   = 300

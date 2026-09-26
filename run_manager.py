@@ -21,10 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ai_analyzer import analyze_spec_with_usage
+from ai_analyzer import (
+    TestPlanItem,
+    generate_suite_from_plan_with_usage,
+    plan_test_suite_with_usage,
+)
 from config import load_config
 from cost_estimator import compute_actual_cost, estimate_run
-from models import AppConfig, TestReport, TestResult, TestSuite
+from models import AppConfig, TestCase, TestReport, TestResult, TestSuite
 from reporter import build_report
 from spec_parser import OpenAPISpec, load_spec
 from test_runner import run_test_suite_async
@@ -55,7 +59,7 @@ class RunState:
     """Текущее состояние прогона в памяти."""
 
     run_id: str
-    status: str                          # pending | running | completed | failed
+    status: str                          # pending | running | awaiting_confirmation | completed | failed | cancelled
     created_at: str
     base_url: str
     spec_filename: str
@@ -67,6 +71,13 @@ class RunState:
     report: Optional[TestReport] = None
     error: Optional[str] = None
     cost: Optional[Dict[str, Any]] = None   # {"estimated": {...}, "actual": {...}}
+    # Подтверждение плана: пайплайн встаёт на паузу после планирования и ждёт решения
+    plan: Optional[List[Dict[str, Any]]] = None        # сериализованный план для UI
+    plan_event: asyncio.Event = field(default_factory=asyncio.Event)
+    plan_decision: Optional[Dict[str, Any]] = None     # {action, excluded_ids, extra_instructions}
+    # Пункты плана, не дошедшие до выполнения (провал генерации/отбраковка валидатором).
+    # Делает явным разрыв «в плане N кейсов → выполнено M». Элемент: {id,name,type,stage,reason}.
+    generation_dropped: Optional[List[Dict[str, Any]]] = None
 
     def meta_dict(self) -> Dict[str, Any]:
         """Возвращает сериализуемое краткое описание для списков и карточек."""
@@ -85,6 +96,10 @@ class RunState:
             d["error"] = self.error
         if self.cost:
             d["cost"] = self.cost
+        if self.plan is not None:
+            d["plan"] = self.plan
+        if self.generation_dropped:
+            d["generation_dropped"] = self.generation_dropped
         return d
 
 
@@ -184,6 +199,7 @@ def create_run(
     auth_type: str = "none",
     auth_token: Optional[str] = None,
     auth_header_name: str = "Authorization",
+    user_instructions: Optional[str] = None,
 ) -> RunState:
     """
     Создаёт запись прогона, сохраняет спеку на диск и запускает фоновый воркер.
@@ -205,6 +221,8 @@ def create_run(
         config.ai_settings.max_test_cases = max_tests
     config.ai_settings.include_negative_tests = include_negative
     config.ai_settings.include_edge_cases = include_edge_cases
+    if user_instructions is not None and user_instructions.strip():
+        config.ai_settings.user_instructions = user_instructions.strip()
 
     # Аутентификация для тестируемого API
     from models import AuthConfig  # локальный импорт, чтобы избежать циклов
@@ -297,23 +315,21 @@ async def _run_pipeline(
                 ),
             ))
 
-        # --- Генерация тест-сьюта ---
-        await _emit(state, RunEvent(
-            type="stage",
-            message="Генерация тест-сьюта через LLM",
-            data={"stage": "generating"},
-        ))
-
-        # analyze_spec синхронный (использует httpx.Client), поэтому запускаем в thread executor
-        # чтобы не блокировать event loop и позволить другим запросам работать параллельно
+        # Фаза планирования и генерации выполняются синхронно (httpx.Client),
+        # поэтому запускаем их в thread executor, чтобы не блокировать event loop.
         loop = asyncio.get_running_loop()
-
-        # Создаём адаптер для событий, который можно передать в analyze_spec
         progress_callback = _make_sync_progress_callback(state, loop)
 
-        suite, usage = await loop.run_in_executor(
+        # --- Этап планирования (LLM + детерминированный догенератор покрытия) ---
+        await _emit(state, RunEvent(
+            type="stage",
+            message="Планирование тест-сьюта",
+            data={"stage": "planning"},
+        ))
+
+        plan_items, plan_usage = await loop.run_in_executor(
             None,
-            lambda: analyze_spec_with_usage(
+            lambda: plan_test_suite_with_usage(
                 spec=spec,
                 settings=config.ai_settings,
                 api_key=None,  # возьмётся из env GPTUNNEL_API_KEY
@@ -321,6 +337,48 @@ async def _run_pipeline(
                 progress_callback=progress_callback,
             ),
         )
+
+        # --- Подтверждение плана пользователем (пауза пайплайна) ---
+        # Может крутить цикл «перепланировать», аккумулируя usage планирования.
+        plan_items, plan_usage = await _await_plan_confirmation(
+            state, spec, config, loop, progress_callback, plan_items, plan_usage
+        )
+        if plan_items is None:
+            # Пользователь отменил прогон
+            state.status = "cancelled"
+            _save_meta(state)
+            await _emit(state, RunEvent(
+                type="complete",
+                message="Прогон отменён пользователем на этапе подтверждения плана",
+                data={"cancelled": True},
+            ))
+            return
+
+        # --- Этап генерации тест-кейсов ---
+        await _emit(state, RunEvent(
+            type="stage",
+            message="Генерация тест-сьюта через LLM",
+            data={"stage": "generating"},
+        ))
+
+        suite, gen_usage = await loop.run_in_executor(
+            None,
+            lambda: generate_suite_from_plan_with_usage(
+                plan=plan_items,
+                spec=spec,
+                settings=config.ai_settings,
+                api_key=None,
+                verbose=False,
+                progress_callback=progress_callback,
+            ),
+        )
+
+        # Суммарное потребление токенов = планирование + генерация
+        usage = {
+            "input_tokens":  plan_usage["input_tokens"] + gen_usage["input_tokens"],
+            "output_tokens": plan_usage["output_tokens"] + gen_usage["output_tokens"],
+            "calls":         plan_usage["calls"] + gen_usage["calls"],
+        }
 
         # --- Фактическая стоимость (по usage из ответов GPTunnel) ---
         actual_cost = compute_actual_cost(
@@ -357,6 +415,22 @@ async def _run_pipeline(
             data={"test_count": len(suite.test_cases)},
         ))
 
+        # Если часть плана не дошла до выполнения — фиксируем это явно (в meta.json и UI),
+        # чтобы разрыв «в плане N → выполнено M» не выглядел как тихая потеря тестов.
+        dropped = getattr(suite, "failed_generations", None)
+        if dropped:
+            state.generation_dropped = dropped
+            _save_meta(state)
+            await _emit(state, RunEvent(
+                type="log",
+                message=(
+                    f"⚠ {len(dropped)} кейс(ов) из плана не дошли до выполнения "
+                    f"(см. generation_dropped в meta.json): "
+                    f"{', '.join(d['id'] for d in dropped)}"
+                ),
+                data={"generation_dropped": dropped},
+            ))
+
         # --- Выполнение тестов ---
         await _emit(state, RunEvent(
             type="stage",
@@ -383,6 +457,7 @@ async def _run_pipeline(
             base_url=state.base_url,
             config=config,
             on_test_complete=on_test_progress,
+            spec=spec,
         )
 
         # --- Формирование отчёта ---
@@ -390,6 +465,7 @@ async def _run_pipeline(
             results=results,
             base_url=state.base_url,
             spec_file=str(spec_path),
+            spec=spec,
         )
         # Прикрепляем стоимость к отчёту
         report.cost = state.cost
@@ -425,6 +501,295 @@ async def _run_pipeline(
     finally:
         # Сигнализируем конец потока событий — подписчики корректно закроют SSE
         await state.queue.put(RunEvent(type="_end", message=""))
+
+
+def create_rerun(source_run_id: str, base_url: Optional[str] = None) -> Optional[RunState]:
+    """
+    Создаёт новый прогон, ВЫПОЛНЯЯ уже сгенерированный сьют исходного прогона
+    без повторного обращения к LLM (регрессия / прогон против другой среды).
+
+    Возвращает RunState нового прогона или None, если у источника нет suite.json.
+    """
+    src_dir = RUNS_DIR / source_run_id
+    suite_src = src_dir / "suite.json"
+    meta_path = src_dir / "meta.json"
+    if not suite_src.exists() or not meta_path.exists():
+        return None
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    spec_filename = meta.get("spec_filename") or "openapi.json"
+    spec_src = src_dir / spec_filename
+    if not spec_src.exists():
+        return None
+
+    run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    run_dir = RUNS_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Переносим спеку и готовый сьют в новый прогон
+    (run_dir / spec_filename).write_text(spec_src.read_text(encoding="utf-8"), encoding="utf-8")
+    (run_dir / "suite.json").write_text(suite_src.read_text(encoding="utf-8"), encoding="utf-8")
+
+    config = load_config()
+    target_url = base_url or meta.get("base_url", "")
+
+    state = RunState(
+        run_id=run_id,
+        status="pending",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        base_url=target_url,
+        spec_filename=spec_filename,
+        model=meta.get("model", ""),
+        max_tests=meta.get("max_tests", 0),
+    )
+    _RUNS[run_id] = state
+    _save_meta(state)
+
+    state.task = asyncio.create_task(
+        _run_rerun_pipeline(state, run_dir / spec_filename, run_dir / "suite.json", config)
+    )
+    return state
+
+
+async def _run_rerun_pipeline(
+    state: RunState,
+    spec_path: Path,
+    suite_path: Path,
+    config: AppConfig,
+) -> None:
+    """Лёгкий пайплайн: загрузить сохранённый сьют → выполнить → отчёт (без LLM)."""
+    run_dir = RUNS_DIR / state.run_id
+    state.status = "running"
+    _save_meta(state)
+
+    try:
+        await _emit(state, RunEvent(
+            type="stage", message="Перепрогон: загрузка сохранённого сьюта",
+            data={"stage": "loading", "rerun": True},
+        ))
+        spec: OpenAPISpec = load_spec(str(spec_path))
+        suite = TestSuite.model_validate(
+            json.loads(suite_path.read_text(encoding="utf-8"))
+        )
+        await _emit(state, RunEvent(
+            type="log",
+            message=f"Сьют загружен: {len(suite.test_cases)} кейсов (без обращения к LLM)",
+            data={"test_count": len(suite.test_cases)},
+        ))
+
+        await _emit(state, RunEvent(
+            type="stage", message="Выполнение тестов",
+            data={"stage": "executing", "total": len(suite.test_cases)},
+        ))
+
+        async def on_test_progress(idx: int, total: int, result: TestResult) -> None:
+            await _emit(state, RunEvent(
+                type="progress",
+                message=f"[{idx}/{total}] {result.test_case_id}: {result.status}",
+                data={
+                    "index": idx, "total": total,
+                    "test_case_id": result.test_case_id,
+                    "test_case_name": result.test_case_name,
+                    "status": result.status,
+                    "duration_ms": result.duration_ms,
+                },
+            ))
+
+        results: List[TestResult] = await run_test_suite_async(
+            suite=suite,
+            base_url=state.base_url,
+            config=config,
+            on_test_complete=on_test_progress,
+            spec=spec,
+        )
+
+        report = build_report(
+            results=results, base_url=state.base_url,
+            spec_file=str(spec_path), spec=spec,
+        )
+        state.report = report
+        (run_dir / "report.json").write_text(
+            json.dumps(report.model_dump(), indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        state.status = "completed"
+        _save_meta(state)
+        await _emit(state, RunEvent(
+            type="complete", message="Перепрогон завершён",
+            data={"summary": report.summary.model_dump()},
+        ))
+    except Exception as exc:
+        state.status = "failed"
+        state.error = f"{type(exc).__name__}: {exc}"
+        _save_meta(state)
+        await _emit(state, RunEvent(
+            type="error", message=str(exc),
+            data={"traceback": traceback.format_exc()},
+        ))
+    finally:
+        await state.queue.put(RunEvent(type="_end", message=""))
+
+
+async def rerun_single_case(
+    source_run_id: str,
+    case_id: Optional[str],
+    base_url: Optional[str] = None,
+    edited_case: Optional[Dict[str, Any]] = None,
+) -> Optional[TestResult]:
+    """
+    Выполняет ОДИН тест-кейс из сохранённого сьюта (для «повторить» / «изменить и
+    повторить»). Если передан edited_case — выполняется он (правка пользователя),
+    иначе берётся кейс case_id из suite.json. Без обращения к LLM.
+
+    Возвращает свежий TestResult этого кейса или None, если кейс/сьют не найдены.
+    """
+    src_dir = RUNS_DIR / source_run_id
+    suite_path = src_dir / "suite.json"
+    meta_path = src_dir / "meta.json"
+    if not suite_path.exists() or not meta_path.exists():
+        return None
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    spec_filename = meta.get("spec_filename") or "openapi.json"
+    spec_path = src_dir / spec_filename
+    if not spec_path.exists():
+        return None
+
+    spec: OpenAPISpec = load_spec(str(spec_path))
+    suite = TestSuite.model_validate(json.loads(suite_path.read_text(encoding="utf-8")))
+
+    if edited_case is not None:
+        try:
+            case = TestCase.model_validate(edited_case)
+        except Exception as exc:
+            raise ValueError(f"Некорректный формат кейса: {exc}") from exc
+    else:
+        case = next((c for c in suite.test_cases if c.id == case_id), None)
+    if case is None:
+        return None
+
+    config = load_config()
+    one_case_suite = TestSuite(
+        test_cases=[case],
+        spec_title=suite.spec_title,
+        spec_version=suite.spec_version,
+    )
+    results = await run_test_suite_async(
+        suite=one_case_suite,
+        base_url=base_url or meta.get("base_url", ""),
+        config=config,
+        spec=spec,
+    )
+    return results[0] if results else None
+
+
+def _compute_plan_coverage(
+    plan_items: List[TestPlanItem], spec: OpenAPISpec
+) -> Dict[str, Any]:
+    """Считает покрытие плана: сколько операций спеки задействовано из общего числа."""
+    from ai_analyzer import _iter_plan_item_ops  # локальный импорт во избежание циклов
+
+    http_methods = {"get", "post", "put", "delete", "patch"}
+    all_ops = {
+        (m.upper(), p)
+        for p, pi in spec.paths.items()
+        if isinstance(pi, dict)
+        for m in pi
+        if m in http_methods
+    }
+    covered = set()
+    for item in plan_items:
+        for m, p, _op in _iter_plan_item_ops(item, spec):
+            covered.add((m.upper(), p))
+    covered &= all_ops
+    uncovered = sorted(f"{m} {p}" for m, p in (all_ops - covered))
+    return {"covered": len(covered), "total": len(all_ops), "uncovered": uncovered}
+
+
+async def _await_plan_confirmation(
+    state: RunState,
+    spec: OpenAPISpec,
+    config: AppConfig,
+    loop: asyncio.AbstractEventLoop,
+    progress_callback: Any,
+    plan_items: List[TestPlanItem],
+    plan_usage: Dict[str, int],
+) -> tuple:
+    """
+    Ставит пайплайн на паузу после планирования и ждёт решения пользователя.
+
+    Возвращает (plan_items, accumulated_plan_usage):
+      - plan_items=None  → пользователь отменил прогон;
+      - иначе            → отфильтрованный по excluded_ids список пунктов к генерации.
+
+    Поддерживает цикл «перепланировать»: при action="replan" перезапускает планирование
+    с обновлёнными user_instructions и снова ждёт подтверждения, суммируя usage.
+    """
+    while True:
+        # Публикуем план и переходим в состояние ожидания подтверждения
+        state.plan = [item.to_dict() for item in plan_items]
+        state.status = "awaiting_confirmation"
+        state.plan_decision = None
+        state.plan_event.clear()
+        _save_meta(state)
+
+        coverage = _compute_plan_coverage(plan_items, spec)
+        await _emit(state, RunEvent(
+            type="plan_ready",
+            message=(
+                f"План готов: {len(plan_items)} тест-кейсов, "
+                f"покрытие {coverage['covered']}/{coverage['total']} эндпоинтов. "
+                f"Подтвердите генерацию."
+            ),
+            data={"plan": state.plan, "coverage": coverage},
+        ))
+
+        # Ждём, пока POST /api/runs/{id}/plan выставит решение и разбудит нас
+        await state.plan_event.wait()
+        decision = state.plan_decision or {"action": "generate"}
+        action = decision.get("action", "generate")
+
+        if action == "cancel":
+            return None, plan_usage
+
+        if action == "replan":
+            extra = (decision.get("extra_instructions") or "").strip()
+            if extra:
+                existing = (config.ai_settings.user_instructions or "").strip()
+                config.ai_settings.user_instructions = (
+                    f"{existing}\n{extra}".strip() if existing else extra
+                )
+            state.status = "running"
+            _save_meta(state)
+            await _emit(state, RunEvent(
+                type="stage",
+                message="Перепланирование тест-сьюта",
+                data={"stage": "planning"},
+            ))
+            plan_items, usage2 = await loop.run_in_executor(
+                None,
+                lambda: plan_test_suite_with_usage(
+                    spec=spec,
+                    settings=config.ai_settings,
+                    api_key=None,
+                    verbose=False,
+                    progress_callback=progress_callback,
+                ),
+            )
+            plan_usage = {
+                "input_tokens":  plan_usage["input_tokens"] + usage2["input_tokens"],
+                "output_tokens": plan_usage["output_tokens"] + usage2["output_tokens"],
+                "calls":         plan_usage["calls"] + usage2["calls"],
+            }
+            continue
+
+        # action == "generate": применяем исключения и выходим из цикла
+        excluded = set(decision.get("excluded_ids") or [])
+        if excluded:
+            plan_items = [it for it in plan_items if it.id not in excluded]
+        state.status = "running"
+        _save_meta(state)
+        return plan_items, plan_usage
 
 
 def _make_sync_progress_callback(state: RunState, loop: asyncio.AbstractEventLoop):

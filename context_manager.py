@@ -21,8 +21,10 @@ class ContextManager:
     тело и query-параметры последующих шагов.
     """
 
-    def __init__(self) -> None:
-        self._store: Dict[str, str] = {}
+    def __init__(self, initial: Optional[Dict[str, str]] = None) -> None:
+        # initial — переменные, доступные с самого начала (например, run_nonce),
+        # без необходимости извлекать их из ответа предыдущего шага.
+        self._store: Dict[str, str] = dict(initial) if initial else {}
 
     # Публичный интерфейс
 

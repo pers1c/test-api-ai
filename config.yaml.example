@@ -22,6 +22,9 @@ auth:
 test_settings:
   timeout: 30.0                   # таймаут на один запрос, секунды
   delay_between_requests: 0.5     # пауза между тест-кейсами, секунды
+  validate_response_body: true    # проверять тело ответа против схемы из спеки
+                                  # (type/required/enum/nullable); при совпадении
+                                  # статус-кода, но несоответствии тела — шаг падает
 
 # -------------------------------------------------------------
 # Настройки LLM (GPTunnel)
@@ -34,7 +37,7 @@ ai_settings:
   model: gpt-4o
 
   max_tokens: 16000               # макс. токенов в одном ответе LLM
-  max_test_cases: 20              # макс. число генерируемых тестов
+  max_test_cases: 200             # ВЕРХНИЙ предел; фактическое число считается из структуры API
   include_negative_tests: true    # негативные тесты (невалидные данные)
   include_edge_cases: true        # граничные случаи
 

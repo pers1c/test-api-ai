@@ -25,6 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import (
     FileResponse,
@@ -34,9 +35,17 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
+load_dotenv(override=False)
 from config import load_config
 from cost_estimator import estimate_run
-from run_manager import RUNS_DIR, create_run, get_run, list_runs
+from run_manager import (
+    RUNS_DIR,
+    create_rerun,
+    create_run,
+    get_run,
+    list_runs,
+    rerun_single_case,
+)
 from spec_parser import load_spec
 
 
@@ -56,14 +65,35 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
-    """Отдаёт единственную HTML-страницу SPA."""
+    """
+    Отдаёт единственную HTML-страницу SPA.
+
+    На лету подставляет cache-busting query-параметр (?v=<mtime>) к ссылкам
+    на app.css и app.js, чтобы браузер при каждом изменении этих файлов
+    тянул свежую версию, а не кэш.
+    """
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(
             status_code=500,
             detail=f"Файл {index_path} не найден. Убедитесь, что static/index.html создан.",
         )
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    html = index_path.read_text(encoding="utf-8")
+
+    # Cache-busting через mtime файлов: меняется содержимое — меняется URL
+    for asset in ("app.css", "app.js"):
+        asset_path = STATIC_DIR / asset
+        if asset_path.exists():
+            version = int(asset_path.stat().st_mtime)
+            html = html.replace(
+                f"/static/{asset}",
+                f"/static/{asset}?v={version}",
+            )
+
+    response = HTMLResponse(html)
+    # Сам HTML тоже не должен кэшироваться — иначе клиент не увидит обновлённые ?v=
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/health")
@@ -93,6 +123,10 @@ async def api_create_run(
     auth_type: str = Form("none", description="Тип аутентификации для тестируемого API"),
     auth_token: Optional[str] = Form(None, description="Токен/ключ для тестируемого API"),
     auth_header_name: str = Form("Authorization", description="Имя заголовка для api_key"),
+    user_instructions: Optional[str] = Form(
+        None,
+        description="Доп. инструкции для модели (опционально): что обязательно проверить",
+    ),
 ) -> JSONResponse:
     """
     Создаёт новый прогон: принимает файл спеки и параметры, запускает фоновый воркер.
@@ -142,9 +176,63 @@ async def api_create_run(
         auth_type=auth_type,
         auth_token=auth_token,
         auth_header_name=auth_header_name,
+        user_instructions=user_instructions,
     )
 
     return JSONResponse({"run_id": state.run_id}, status_code=201)
+
+
+@app.post("/api/runs/{run_id}/rerun")
+async def api_run_rerun(run_id: str, payload: Optional[dict] = None) -> JSONResponse:
+    """
+    Перепрогон сохранённого сьюта исходного прогона БЕЗ обращения к LLM.
+    Опционально принимает {"base_url": "..."} — прогнать против другой среды.
+    Возвращает run_id нового прогона.
+    """
+    if get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="Прогон не найден")
+
+    base_url = (payload or {}).get("base_url")
+    if base_url and not str(base_url).startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="base_url должен начинаться с http:// или https://",
+        )
+
+    state = create_rerun(run_id, base_url=base_url)
+    if state is None:
+        raise HTTPException(
+            status_code=400,
+            detail="У исходного прогона нет сохранённого сьюта (suite.json) для перепрогона",
+        )
+    return JSONResponse({"run_id": state.run_id}, status_code=201)
+
+
+@app.post("/api/runs/{run_id}/rerun-case")
+async def api_rerun_case(run_id: str, payload: dict) -> JSONResponse:
+    """
+    Перепрогон ОДНОГО кейса из сохранённого сьюта (повторить / изменить-и-повторить).
+    Тело: {"case_id": str, "base_url"?: str, "case"?: {...правка TestCase...}}.
+    Возвращает свежий TestResult кейса (без обращения к LLM).
+    """
+    if get_run(run_id) is None:
+        raise HTTPException(status_code=404, detail="Прогон не найден")
+
+    case_id = payload.get("case_id")
+    base_url = payload.get("base_url")
+    edited = payload.get("case")
+    if not case_id and edited is None:
+        raise HTTPException(status_code=400, detail="Нужен case_id или case")
+    if base_url and not str(base_url).startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="base_url должен начинаться с http(s)://")
+
+    try:
+        result = await rerun_single_case(run_id, case_id, base_url, edited)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if result is None:
+        raise HTTPException(status_code=404, detail="Кейс или сохранённый сьют не найдены")
+    return JSONResponse(result.model_dump())
 
 
 @app.post("/api/estimate")
@@ -318,3 +406,49 @@ async def api_run_suite(run_id: str) -> JSONResponse:
     if not suite_path.exists():
         raise HTTPException(status_code=404, detail="Тест-сьют ещё не сгенерирован")
     return JSONResponse(json.loads(suite_path.read_text(encoding="utf-8")))
+
+
+@app.get("/api/runs/{run_id}/plan")
+async def api_run_plan(run_id: str) -> JSONResponse:
+    """Возвращает запланированный тест-сьют (для переподключения к шагу подтверждения)."""
+    state = get_run(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Прогон не найден")
+    if state.plan is None:
+        raise HTTPException(status_code=404, detail="План ещё не составлен")
+    return JSONResponse({"plan": state.plan, "status": state.status})
+
+
+@app.post("/api/runs/{run_id}/plan")
+async def api_run_plan_decision(run_id: str, decision: dict) -> JSONResponse:
+    """
+    Решение пользователя по плану на шаге подтверждения.
+
+    Тело JSON:
+      {
+        "action": "generate" | "cancel" | "replan",
+        "excluded_ids": ["tc_003", ...],   // для generate — какие пункты не генерировать
+        "extra_instructions": "..."         // для replan — доп. инструкции планировщику
+      }
+    """
+    state = get_run(run_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Прогон не найден")
+    if state.status != "awaiting_confirmation":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Прогон не ожидает подтверждения плана (статус: {state.status})",
+        )
+
+    action = (decision or {}).get("action", "generate")
+    if action not in ("generate", "cancel", "replan"):
+        raise HTTPException(status_code=400, detail=f"Недопустимое действие: {action}")
+
+    state.plan_decision = {
+        "action": action,
+        "excluded_ids": (decision or {}).get("excluded_ids") or [],
+        "extra_instructions": (decision or {}).get("extra_instructions") or "",
+    }
+    # Будим фоновый воркер, ожидающий на plan_event
+    state.plan_event.set()
+    return JSONResponse({"ok": True, "action": action})

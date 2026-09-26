@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -31,6 +32,7 @@ async def run_test_suite_async(
     base_url: str,
     config: AppConfig,
     on_test_complete: Optional[Any] = None,
+    spec: Optional[Any] = None,
 ) -> List[TestResult]:
     """
     Выполняет все тест-кейсы из сьюта против целевого сервера.
@@ -41,6 +43,8 @@ async def run_test_suite_async(
         config:           Конфигурация приложения (аутентификация, таймауты, задержки).
         on_test_complete: Async callback (index, total, result) -> None,
                           вызывается после завершения каждого тест-кейса.
+        spec:             OpenAPISpec — если передан и включена валидация тела ответа,
+                          тело успешных ответов проверяется против схемы из спеки.
 
     Возвращает:
         Список TestResult, по одному на каждый тест-кейс.
@@ -48,6 +52,22 @@ async def run_test_suite_async(
     return await _run_suite_async(
         suite, base_url, config,
         on_test_complete=on_test_complete,
+        spec=spec,
+    )
+
+
+def run_test_suite(
+    suite: TestSuite,
+    base_url: str,
+    config: AppConfig,
+    verbose: bool = False,
+    spec: Optional[Any] = None,
+) -> List[TestResult]:
+    """
+    Синхронная обёртка над run_test_suite_async — для CLI и скриптов вне event loop.
+    """
+    return asyncio.run(
+        run_test_suite_async(suite, base_url, config, spec=spec)
     )
 
 
@@ -56,6 +76,7 @@ async def _run_suite_async(
     base_url: str,
     config: AppConfig,
     on_test_complete: Optional[Any] = None,
+    spec: Optional[Any] = None,
 ) -> List[TestResult]:
     """Асинхронная реализация, выполняющая все тест-кейсы последовательно."""
     auth_headers = build_auth_headers(config)
@@ -80,6 +101,11 @@ async def _run_suite_async(
 
     total = len(suite.test_cases)
 
+    # Уникальный для прогона идентификатор. Доступен всем шагам как {{run_nonce}}.
+    # Нужен, чтобы регистрируемые логины/email были уникальны МЕЖДУ прогонами —
+    # иначе повторный прогон против персистентной БД получает 400 "username taken".
+    run_nonce = uuid.uuid4().hex[:8]
+
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(settings.timeout),
         follow_redirects=True,
@@ -97,6 +123,8 @@ async def _run_suite_async(
                 auth_headers=auth_headers,
                 auth_query_params=auth_query_params,
                 settings=settings,
+                run_nonce=run_nonce,
+                spec=spec,
             )
             results.append(result)
 
@@ -122,14 +150,19 @@ async def _run_test_case(
     auth_headers: Dict[str, str],
     auth_query_params: Dict[str, str],
     settings: Any,
+    run_nonce: str = "",
+    spec: Optional[Any] = None,
 ) -> TestResult:
     """
     Выполняет все шаги одного тест-кейса по порядку.
 
     Пропускает последующие шаги, если требуемая переменная недоступна
     из-за падения предыдущего шага с извлечением.
+
+    run_nonce — уникальный для прогона маркер, доступный шагам как {{run_nonce}}.
     """
-    context = ContextManager()
+    validate_body = bool(spec is not None and getattr(settings, "validate_response_body", False))
+    context = ContextManager(initial={"run_nonce": run_nonce} if run_nonce else None)
     step_results: List[StepResult] = []
     case_start = time.perf_counter()
     overall_status = "passed"
@@ -166,6 +199,7 @@ async def _run_test_case(
             context=context,
             auth_headers=auth_headers,
             auth_query_params=auth_query_params,
+            spec=spec if validate_body else None,
         )
         step_results.append(step_result)
 
@@ -204,12 +238,16 @@ async def _run_step(
     context: ContextManager,
     auth_headers: Dict[str, str],
     auth_query_params: Dict[str, str],
+    spec: Optional[Any] = None,
 ) -> StepResult:
     """
     Выполняет один HTTP-запрос и возвращает его результат.
 
     Объединяет заголовки аутентификации с заголовками шага (заголовки шага имеют приоритет).
     Извлекает переменные из ответа для использования в последующих шагах.
+
+    Если передан spec, тело ответа при совпадении статус-кода проверяется против
+    объявленной в спеке схемы (см. response_validator).
     """
     # Формируем полный URL — обрабатываем path-параметры {param}, уже подставленные ранее
     endpoint = step.endpoint
@@ -258,12 +296,32 @@ async def _run_step(
 
     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
-    # Определяем успех/провал
-    passed = (actual_status == step.expected_status) if actual_status is not None else False
+    # Определяем успех/провал по статус-коду
+    status_ok = (actual_status == step.expected_status) if actual_status is not None else False
+    passed = status_ok
 
-    # Извлекаем переменные из ответа для последующих шагов
+    # Валидация тела ответа против схемы из спеки (только когда статус совпал —
+    # тогда тело должно быть «успешным» и соответствовать объявленной схеме).
+    schema_errors: Optional[List[str]] = None
+    if spec is not None and status_ok and error_message is None and response_body is not None:
+        try:
+            from response_validator import validate_response_body
+            errs = validate_response_body(
+                spec, step.method, step.endpoint, actual_status, response_body
+            )
+            if errs:
+                schema_errors = errs
+                passed = False
+        except Exception:
+            # Валидация схемы не должна ронять прогон — при сбое просто пропускаем.
+            schema_errors = None
+
+    # Извлекаем переменные из ответа для последующих шагов.
+    # Гейтим по status_ok, а не по passed: если HTTP-вызов успешен, переменные
+    # (токен, id) должны извлечься даже при незначительном расхождении тела со
+    # схемой — иначе одно нарушение схемы каскадно роняет весь контекстный кейс.
     extracted_values: Optional[Dict[str, str]] = None
-    if passed and step.extract and response_body is not None:
+    if status_ok and step.extract and response_body is not None:
         try:
             extracted_values = context.extract_values(response_body, step.extract)
         except Exception:
@@ -289,6 +347,7 @@ async def _run_step(
         error_message=error_message,
         extracted_values=extracted_values,
         skipped=False,
+        schema_errors=schema_errors,
     )
 
 

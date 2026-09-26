@@ -112,6 +112,20 @@
           </div>
         </div>
 
+        <!-- Доп. инструкции для модели (опционально) -->
+        <div class="field">
+          <label class="field-label" for="user-instructions">
+            Доп. инструкции для модели (опционально)
+          </label>
+          <textarea
+            id="user-instructions"
+            name="user_instructions"
+            class="input"
+            rows="3"
+            placeholder="Например: обязательно проверь rate-limit на /search; покрой негативами все /admin/* эндпоинты"
+          ></textarea>
+        </div>
+
         <!-- Авторизация тестируемого API -->
         <details class="auth-details">
           <summary class="auth-summary">Авторизация тестируемого API</summary>
@@ -185,13 +199,48 @@
             <span class="stage-mark">01</span>
             <span class="stage-name">Парсинг спеки</span>
           </div>
-          <div class="stage" data-stage="generating">
+          <div class="stage" data-stage="planning">
             <span class="stage-mark">02</span>
+            <span class="stage-name">План</span>
+          </div>
+          <div class="stage" data-stage="generating">
+            <span class="stage-mark">03</span>
             <span class="stage-name">Генерация тестов</span>
           </div>
           <div class="stage" data-stage="executing">
-            <span class="stage-mark">03</span>
+            <span class="stage-mark">04</span>
             <span class="stage-name">Выполнение</span>
+          </div>
+        </div>
+
+        <!-- Подтверждение плана перед генерацией -->
+        <div class="plan-review" id="plan-review" hidden>
+          <div class="plan-review-header">
+            <span class="plan-review-title">Подтверждение плана</span>
+            <span class="plan-coverage" id="plan-coverage"></span>
+          </div>
+          <p class="plan-review-hint">
+            Снимите галочки с пунктов, которые не нужно генерировать. Можно добавить
+            инструкции и перепланировать.
+          </p>
+          <div class="plan-list" id="plan-list"></div>
+          <div class="field">
+            <label class="field-label" for="plan-extra-instructions">
+              Доп. инструкции для перепланирования (необязательно)
+            </label>
+            <textarea
+              id="plan-extra-instructions"
+              class="input"
+              rows="2"
+              placeholder="Например: добавь негативные тесты на /orders; покрой все коды 409"
+            ></textarea>
+          </div>
+          <div class="plan-review-actions">
+            <button type="button" class="btn btn-primary" id="plan-generate-btn">
+              <span class="btn-label">Сгенерировать</span>
+            </button>
+            <button type="button" class="btn btn-ghost" id="plan-replan-btn">Перепланировать</button>
+            <button type="button" class="btn btn-ghost" id="plan-cancel-btn">Отменить</button>
           </div>
         </div>
 
@@ -226,10 +275,13 @@
       <div class="report-header">
         <button class="btn btn-ghost btn-small" id="back-to-runs">← Назад</button>
         <div class="report-title" id="report-title">Отчёт</div>
+        <button class="btn btn-ghost btn-small" id="report-rerun" title="Выполнить тот же сьют заново без обращения к LLM">↻ Перепрогнать</button>
         <a class="btn btn-ghost btn-small" id="report-download" href="#" download>Скачать JSON</a>
       </div>
 
       <div class="report-summary" id="report-summary"></div>
+
+      <div class="report-coverage" id="report-coverage"></div>
 
       <div class="report-tests" id="report-tests"></div>
     </section>
